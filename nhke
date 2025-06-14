@@ -1,0 +1,111 @@
+  subroutine correct_pressure()
+    integer :: i, j, iter
+    real :: err, coef
+
+    ! Step 2-1: 発散 div = du/dx + dw/dz
+    do j = 2, nz-1
+      do i = 2, nx-1
+        div(i,j) = ((u_star(i+1,j) - u_star(i-1,j)) / (2.0*dx)) + &
+                   ((w_star(i,j+1) - w_star(i,j-1)) / (2.0*dz))
+      end do
+    end do
+
+    ! Step 2-2: 圧力補正 Poisson解
+    do iter = 1, max_iter
+      err = 0.0
+      do j = 2, nz-1
+        do i = 2, nx-1
+          coef = 1.0 / (2.0/dx**2 + 2.0/dz**2)
+          dp(i,j) = (1.0 - omega)*dp(i,j) + omega * coef * &
+                    ((dp(i+1,j) + dp(i-1,j))/dx**2 + &
+                     (dp(i,j+1) + dp(i,j-1))/dz**2 - rho0/dt * div(i,j))
+          err = err + abs(dp(i,j))
+        end do
+      end do
+      if (err < eps) exit
+    end do
+
+    ! Step 2-3: 圧力更新
+    do j = 2, nz-1
+      do i = 2, nx-1
+        p(i,j) = p(i,j) + dp(i,j)
+      end do
+    end do
+
+    ! Step 2-4: 速度修正
+    do j = 2, nz-1
+      do i = 2, nx-1
+        u(i,j) = u_star(i,j) - dt/rho0 * (dp(i+1,j) - dp(i-1,j)) / (2.0*dx)
+        w(i,j) = w_star(i,j) - dt/rho0 * (dp(i,j+1) - dp(i,j-1)) / (2.0*dz)
+      end do
+    end do
+
+  end subroutine correct_pressure
+
+  subroutine update_momentum()
+    integer :: i, j
+    real :: dudx, dudz, dwdx, dwdz, delta, buoyancy
+    real :: visc_u, visc_w
+
+    do j = 2, nz-1
+      do i = 2, nx-1
+        ! u★（x方向速度）
+        dudx = (u(i+1,j) - u(i-1,j)) / (2.0*dx)
+        dudz = (u(i,j+1) - u(i,j-1)) / (2.0*dz)
+        visc_u = (nut(i+1,j) * (u(i+1,j) - u(i,j)) - nut(i-1,j) * (u(i,j) - u(i-1,j))) / dx**2 + &
+                 (nut(i,j+1) * (u(i,j+1) - u(i,j)) - nut(i,j-1) * (u(i,j) - u(i,j-1))) / dz**2
+        u_star(i,j) = u(i,j) + dt * (-u(i,j)*dudx - w(i,j)*dudz + visc_u)
+
+        ! w★（z方向速度：浮力を含む）
+        dwdx = (w(i+1,j) - w(i-1,j)) / (2.0*dx)
+        dwdz = (w(i,j+1) - w(i,j-1)) / (2.0*dz)
+        visc_w = (nut(i+1,j) * (w(i+1,j) - w(i,j)) - nut(i-1,j) * (w(i,j) - w(i-1,j))) / dx**2 + &
+                 (nut(i,j+1) * (w(i,j+1) - w(i,j)) - nut(i,j-1) * (w(i,j) - w(i,j-1))) / dz**2
+
+        delta = (rho0 - rho(i,j)) / rho0
+        buoyancy = -g * delta
+
+        w_star(i,j) = w(i,j) + dt * (-u(i,j)*dwdx - w(i,j)*dwdz + visc_w + buoyancy)
+      end do
+    end do
+  end subroutine update_momentum
+
+  subroutine update_turbulence()
+    integer :: i, j
+    real :: dudx, dwdz, dudz, dwdx, Pk, Gb
+    real :: diff_k, diff_e, dkdx2, dkdz2, dedx2, dedz2
+
+    do j = 2, nz-1
+      do i = 2, nx-1
+        ! 乱流エネルギー生成 Pk
+        dudx = (u(i+1,j) - u(i-1,j)) / (2.0*dx)
+        dwdz = (w(i,j+1) - w(i,j-1)) / (2.0*dz)
+        dudz = (u(i,j+1) - u(i,j-1)) / (2.0*dz)
+        dwdx = (w(i+1,j) - w(i-1,j)) / (2.0*dx)
+
+        Pk = nut(i,j) * (dudx**2 + dwdz**2 + 0.5*(dudz + dwdx)**2)
+
+        ! 浮力項 Gb（密度差により）
+        Gb = -g * (rho0 - rho(i,j)) / rho0
+
+        ! 拡散項
+        dkdx2 = (k(i+1,j) - 2*k(i,j) + k(i-1,j)) / dx**2
+        dkdz2 = (k(i,j+1) - 2*k(i,j) + k(i,j-1)) / dz**2
+        diff_k = (nu + nut(i,j)/sigma_k) * (dkdx2 + dkdz2)
+
+        dedx2 = (e(i+1,j) - 2*e(i,j) + e(i-1,j)) / dx**2
+        dedz2 = (e(i,j+1) - 2*e(i,j) + e(i,j-1)) / dz**2
+        diff_e = (nu + nut(i,j)/sigma_e) * (dedx2 + dedz2)
+
+        ! kの更新（浮力項含む）
+        k(i,j) = k(i,j) + dt * (Pk + Gb - e(i,j) + diff_k)
+
+        ! εの更新（浮力項は無視）
+        e(i,j) = e(i,j) + dt * ((c1e * Pk * e(i,j) / k(i,j)) - &
+                                (c2e * e(i,j)**2 / k(i,j)) + diff_e)
+
+        ! 渦動粘性係数の更新
+        nut(i,j) = c_mu * k(i,j)**2 / e(i,j)
+      end do
+    end do
+  end subroutine update_turbulence
